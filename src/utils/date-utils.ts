@@ -141,6 +141,30 @@ function nextBlackoutStartAfter(dt: DateTime, blackouts: BlackoutWindow[]): Date
   return best;
 }
 
+
+export function pushEndPastBlackouts(
+  startISO: string,
+  endISO: string,
+  blackouts: BlackoutWindow[],
+): string {
+  if (blackouts.length === 0) return endISO;
+  const start = parseUTC(startISO);
+  const baseMinutes = minutesBetween(start, parseUTC(endISO));
+  let end = parseUTC(endISO);
+
+  for (let i = 0; i < MAX_ITERATIONS; i++) {
+    const endISONow = toISO(end);
+    let blocked = 0;
+    for (const b of blackouts) {
+      blocked += overlapMinutes(startISO, endISONow, b.startDate, b.endDate);
+    }
+    const newEnd = start.plus({ minutes: baseMinutes + blocked });
+    if (newEnd.toMillis() === end.toMillis()) break;
+    end = newEnd;
+  }
+  return toISO(end);
+}
+
 function tryNextWorkingInstant(
   dt: DateTime,
   hours: OperatingHours[],

@@ -7,6 +7,7 @@ import {
   minutesBetween,
   intervalsOverlap,
   pushEndPastClosures,
+  pushEndPastBlackouts,
 } from "../utils/date-utils.js";
 
 export class ReflowService {
@@ -31,9 +32,12 @@ export class ReflowService {
       );
     }
 
-    // Market hours first: set each task's start/end against its channel's open
-    // windows, then feed only this.updatedTask through the remaining passes.
-    this.#marketHours(settlementTasks, settlementChannels);
+    // Blackout windows first: moving a task out of a blackout changes its dates,
+    // which in turn changes how the market-hours pass sees it — so resolve
+    // blackouts before everything else
+    this.#blackout(settlementTasks, settlementChannels);
+
+    this.#marketHours(this.updatedTask, settlementChannels);
 
     this.#dependencies(this.updatedTask);
 
@@ -49,9 +53,48 @@ export class ReflowService {
       changes: this.changes,
       explanation:
         this.changes.length === 0
-          ? "No changes needed; tasks already satisfy operating hours, dependencies, and channel constraints."
-          : `Applied ${this.changes.length} change(s) to satisfy operating hours, dependencies, and channel conflicts.`,
+          ? "No changes needed; tasks already satisfy blackout windows, operating hours, dependencies, and channel constraints."
+          : `Applied ${this.changes.length} change(s) to satisfy blackout windows, operating hours, dependencies, and channel conflicts.`,
     };
+  }
+
+  /**
+   * Regulatory blackout windows. No processing may happen during a channel's
+   * blackout periods, so for each task the end is extended by the blackout time
+   * that overlaps its span (the blocked time is paused). Start is left as given;
+   * channels with no blackout windows impose no constraint.
+   *
+   * Appends each move to this.changes and saves the result in this.updatedTask.
+   */
+  #blackout(tasks: SettlementTask[], channels: SettlementChannel[]): SettlementTask[] {
+    const channelById = new Map<string, SettlementChannel>();
+    for (const c of channels) channelById.set(c.docId, c);
+
+    this.updatedTask = tasks.map((task) => {
+      const channel = channelById.get(task.data.settlementChannelId);
+      const blackouts = channel?.data.blackoutWindows ?? [];
+      if (blackouts.length === 0) return task;
+
+      const newEnd = pushEndPastBlackouts(task.data.startDate, task.data.endDate, blackouts);
+      if (parseUTC(newEnd).toMillis() === parseUTC(task.data.endDate).toMillis()) {
+        return task;
+      }
+
+      this.changes.push({
+        taskId: task.docId,
+        taskReference: task.data.taskReference,
+        originalStartDate: task.data.startDate,
+        originalEndDate: task.data.endDate,
+        newStartDate: task.data.startDate,
+        newEndDate: newEnd,
+        delayMinutes: minutesBetween(parseUTC(task.data.endDate), parseUTC(newEnd)),
+        triggeredBy: ["blackoutWindow"],
+        reason: `End moved to ${newEnd}: processing pauses during a blackout window on ${channel?.data.name ?? "the channel"}.`,
+      });
+      return { ...task, data: { ...task.data, endDate: newEnd } };
+    });
+
+    return this.updatedTask;
   }
 
   #marketHours(tasks: SettlementTask[], channels: SettlementChannel[]): SettlementTask[] {
