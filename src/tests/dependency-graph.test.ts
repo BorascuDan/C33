@@ -14,6 +14,7 @@ function task(
   dependsOnTaskIds: string[] = [],
   startDate = "2024-01-15T08:00:00Z",
   durationMinutes = 60,
+  settlementChannelId = docId, // unique per task -> isolates dependency tests from channel conflicts
 ): SettlementTask {
   const endDate = DateTime.fromISO(startDate, { zone: "utc" })
     .plus({ minutes: durationMinutes })
@@ -24,7 +25,7 @@ function task(
     data: {
       taskReference: docId,
       tradeOrderId: "TRD-1",
-      settlementChannelId: "CH-1",
+      settlementChannelId,
       startDate,
       endDate,
       durationMinutes,
