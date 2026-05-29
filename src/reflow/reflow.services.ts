@@ -3,7 +3,6 @@ import { UnsatisfiableScheduleError } from "./types.js";
 import { buildDependencyGraph, hasCycle } from "../utils/dependency-graph.js";
 
 export class ReflowService {
-
   reflow(input: { settlementTasks: SettlementTask[] }): ReflowResult {
     const { settlementTasks } = input;
 
