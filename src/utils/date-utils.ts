@@ -89,6 +89,41 @@ function nextOperatingOpen(dt: DateTime, hours: OperatingHours[]): DateTime | nu
   return null;
 }
 
+function isOperatingEnd(end: DateTime, hours: OperatingHours[]): boolean {
+  return windowsForDay(end, hours).some((w) => w.start < end && end <= w.end);
+}
+
+function previousOperatingClose(t: DateTime, hours: OperatingHours[]): DateTime | null {
+  for (let offset = 0; offset <= MAX_LOOKAHEAD_DAYS; offset++) {
+    const closed = windowsForDay(t.minus({ days: offset }), hours).filter((w) => w.end <= t);
+    if (closed.length > 0) return closed[closed.length - 1]!.end; // sorted by start
+  }
+  return null;
+}
+
+function nextOperatingOpenAt(t: DateTime, hours: OperatingHours[]): DateTime | null {
+  for (let offset = 0; offset <= MAX_LOOKAHEAD_DAYS; offset++) {
+    for (const w of windowsForDay(t.plus({ days: offset }), hours)) {
+      if (w.start >= t) return w.start;
+    }
+  }
+  return null;
+}
+
+export function pushEndPastClosures(endISO: string, hours: OperatingHours[]): string {
+  if (hours.length === 0) return endISO;
+  let end = parseUTC(endISO);
+  for (let i = 0; i < MAX_ITERATIONS; i++) {
+    if (isOperatingEnd(end, hours)) break;
+    const closeStart = previousOperatingClose(end, hours);
+    const reopen = nextOperatingOpenAt(end, hours);
+    if (!closeStart || !reopen) break;
+    const spill = minutesBetween(closeStart, end);
+    end = reopen.plus({ minutes: spill });
+  }
+  return toISO(end);
+}
+
 function blackoutContaining(dt: DateTime, blackouts: BlackoutWindow[]): BlackoutWindow | undefined {
   return blackouts.find((b) => dt >= parseUTC(b.startDate) && dt < parseUTC(b.endDate));
 }

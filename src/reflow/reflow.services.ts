@@ -1,17 +1,26 @@
-import type { SettlementTask, ScheduleChange, ReflowResult } from "./types.js";
+import type { SettlementTask, SettlementChannel, ScheduleChange, ReflowResult } from "./types.js";
 import { UnsatisfiableScheduleError } from "./types.js";
 import { buildDependencyGraph, hasCycle } from "../utils/dependency-graph.js";
-import { parseUTC, toISO, minutesBetween, intervalsOverlap } from "../utils/date-utils.js";
+import {
+  parseUTC,
+  toISO,
+  minutesBetween,
+  intervalsOverlap,
+  pushEndPastClosures,
+} from "../utils/date-utils.js";
 
 export class ReflowService {
   private updatedTask: SettlementTask[] = [];
   private changes: ScheduleChange[] = [];
 
-  reflow(input: { settlementTasks: SettlementTask[] }): ReflowResult {
+  reflow(input: {
+    settlementTasks: SettlementTask[];
+    settlementChannels?: SettlementChannel[];
+  }): ReflowResult {
     this.updatedTask = [];
     this.changes = [];
 
-    const { settlementTasks } = input;
+    const { settlementTasks, settlementChannels = [] } = input;
 
     const graph = buildDependencyGraph(settlementTasks);
     if (hasCycle(graph)) {
@@ -22,7 +31,11 @@ export class ReflowService {
       );
     }
 
-    this.#dependencies(settlementTasks);
+    // Market hours first: set each task's start/end against its channel's open
+    // windows, then feed only this.updatedTask through the remaining passes.
+    this.#marketHours(settlementTasks, settlementChannels);
+
+    this.#dependencies(this.updatedTask);
 
     // @upgrade In a real production environment, channel-conflict serialization
     // would be better solved with a message broker: publish each settlement task
@@ -36,9 +49,40 @@ export class ReflowService {
       changes: this.changes,
       explanation:
         this.changes.length === 0
-          ? "No changes needed; tasks already satisfy their dependencies and channel constraints."
-          : `Applied ${this.changes.length} change(s) to satisfy dependencies and resolve channel conflicts.`,
+          ? "No changes needed; tasks already satisfy operating hours, dependencies, and channel constraints."
+          : `Applied ${this.changes.length} change(s) to satisfy operating hours, dependencies, and channel conflicts.`,
     };
+  }
+
+  #marketHours(tasks: SettlementTask[], channels: SettlementChannel[]): SettlementTask[] {
+    const channelById = new Map<string, SettlementChannel>();
+    for (const c of channels) channelById.set(c.docId, c);
+
+    this.updatedTask = tasks.map((task) => {
+      const channel = channelById.get(task.data.settlementChannelId);
+      const hours = channel?.data.operatingHours ?? [];
+      if (hours.length === 0) return task;
+
+      const newEnd = pushEndPastClosures(task.data.endDate, hours);
+      if (parseUTC(newEnd).toMillis() === parseUTC(task.data.endDate).toMillis()) {
+        return task;
+      }
+
+      this.changes.push({
+        taskId: task.docId,
+        taskReference: task.data.taskReference,
+        originalStartDate: task.data.startDate,
+        originalEndDate: task.data.endDate,
+        newStartDate: task.data.startDate,
+        newEndDate: newEnd,
+        delayMinutes: minutesBetween(parseUTC(task.data.endDate), parseUTC(newEnd)),
+        triggeredBy: ["operatingHours"],
+        reason: `End moved to ${newEnd}: processing pauses while ${channel?.data.name ?? "the channel"} is closed.`,
+      });
+      return { ...task, data: { ...task.data, endDate: newEnd } };
+    });
+
+    return this.updatedTask;
   }
 
   #dependencies(tasks: SettlementTask[]): SettlementTask[] {
@@ -66,14 +110,13 @@ export class ReflowService {
         }
       }
 
-      const end = start.plus({ minutes: task.data.durationMinutes });
+      const delta = minutesBetween(parseUTC(task.data.startDate), start);
+      const end = parseUTC(task.data.endDate).plus({ minutes: delta });
       const startISO = toISO(start);
       const endISO = toISO(end);
       schedule[task.docId] = { start: startISO, end: endISO };
 
-      const movedStart = start.toMillis() !== parseUTC(task.data.startDate).toMillis();
-      const movedEnd = end.toMillis() !== parseUTC(task.data.endDate).toMillis();
-      if (movedStart || movedEnd) {
+      if (delta !== 0) {
         const depRef = bindingDepId
           ? byId.get(bindingDepId)?.data.taskReference ?? bindingDepId
           : undefined;
@@ -86,9 +129,7 @@ export class ReflowService {
           newEndDate: endISO,
           delayMinutes: minutesBetween(parseUTC(task.data.endDate), end),
           triggeredBy: ["dependency"],
-          reason: depRef
-            ? `Start moved to ${startISO} to begin after dependency ${depRef} completes.`
-            : `End normalized to ${endISO} (start + ${task.data.durationMinutes}m).`,
+          reason: `Start moved to ${startISO} to begin after dependency ${depRef ?? "upstream"} completes.`,
         });
       }
 
@@ -121,6 +162,7 @@ export class ReflowService {
 
       let start = task.data.startDate;
       let end = task.data.endDate;
+      const spanMinutes = minutesBetween(parseUTC(start), parseUTC(end));
 
       let bumped = true;
       while (bumped) {
@@ -128,7 +170,7 @@ export class ReflowService {
         for (const [s, e] of lane) {
           if (intervalsOverlap(start, end, s, e)) {
             start = e;
-            end = toISO(parseUTC(start).plus({ minutes: task.data.durationMinutes }));
+            end = toISO(parseUTC(start).plus({ minutes: spanMinutes }));
             bumped = true;
           }
         }
