@@ -1,7 +1,7 @@
 import type { SettlementTask, ScheduleChange, ReflowResult } from "./types.js";
 import { UnsatisfiableScheduleError } from "./types.js";
 import { buildDependencyGraph, hasCycle } from "../utils/dependency-graph.js";
-import { parseUTC, toISO, minutesBetween } from "../utils/date-utils.js";
+import { parseUTC, toISO, minutesBetween, intervalsOverlap } from "../utils/date-utils.js";
 
 export class ReflowService {
   private updatedTask: SettlementTask[] = [];
@@ -24,13 +24,20 @@ export class ReflowService {
 
     this.#dependencies(settlementTasks);
 
+    // @upgrade In a real production environment, channel-conflict serialization
+    // would be better solved with a message broker: publish each settlement task
+    // to a per-channel (per-topic) queue and let a single consumer process one
+    // message at a time. The channel then physically cannot run two tasks at
+    // once, instead of us detecting and repairing overlaps after the fact.
+    this.#conflicts(this.updatedTask);
+
     return {
       updatedTasks: this.updatedTask,
       changes: this.changes,
       explanation:
         this.changes.length === 0
-          ? "All tasks already start after their dependencies; no changes needed."
-          : `Rescheduled ${this.changes.length} task(s) so each starts after its dependencies complete.`,
+          ? "No changes needed; tasks already satisfy their dependencies and channel constraints."
+          : `Applied ${this.changes.length} change(s) to satisfy dependencies and resolve channel conflicts.`,
     };
   }
 
@@ -91,6 +98,63 @@ export class ReflowService {
     this.updatedTask = tasks.map((task) => {
       const { start, end } = resolve(task);
       return { ...task, data: { ...task.data, startDate: start, endDate: end } };
+    });
+
+    return this.updatedTask;
+  }
+
+  #conflicts(tasks: SettlementTask[]): SettlementTask[] {
+    const lanes = new Map<string, Set<[string, string]>>();
+    const resolved = new Map<string, { start: string; end: string }>();
+
+    const order = [...tasks].sort(
+      (a, b) => parseUTC(a.data.startDate).toMillis() - parseUTC(b.data.startDate).toMillis(),
+    );
+
+    for (const task of order) {
+      const key = `${task.data.settlementChannelId}::${task.data.taskType}`;
+      let lane = lanes.get(key);
+      if (!lane) {
+        lane = new Set<[string, string]>();
+        lanes.set(key, lane);
+      }
+
+      let start = task.data.startDate;
+      let end = task.data.endDate;
+
+      let bumped = true;
+      while (bumped) {
+        bumped = false;
+        for (const [s, e] of lane) {
+          if (intervalsOverlap(start, end, s, e)) {
+            start = e;
+            end = toISO(parseUTC(start).plus({ minutes: task.data.durationMinutes }));
+            bumped = true;
+          }
+        }
+      }
+
+      lane.add([start, end]);
+      resolved.set(task.docId, { start, end });
+
+      if (parseUTC(start).toMillis() !== parseUTC(task.data.startDate).toMillis()) {
+        this.changes.push({
+          taskId: task.docId,
+          taskReference: task.data.taskReference,
+          originalStartDate: task.data.startDate,
+          originalEndDate: task.data.endDate,
+          newStartDate: start,
+          newEndDate: end,
+          delayMinutes: minutesBetween(parseUTC(task.data.endDate), parseUTC(end)),
+          triggeredBy: ["channelConflict"],
+          reason: `Moved to ${start} to avoid a channel conflict on ${task.data.settlementChannelId} (${task.data.taskType}).`,
+        });
+      }
+    }
+
+    this.updatedTask = tasks.map((task) => {
+      const r = resolved.get(task.docId)!;
+      return { ...task, data: { ...task.data, startDate: r.start, endDate: r.end } };
     });
 
     return this.updatedTask;
