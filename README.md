@@ -1,3 +1,6 @@
+LINK LOOM VIDEO:
+https://www.loom.com/share/2321ae8b9d2a48d58e604318c8f22fa7
+
 # Settlement Schedule Reflow
 
 A TypeScript reflow engine for a financial-operations platform. When disruptions
